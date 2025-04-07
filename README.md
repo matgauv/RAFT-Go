@@ -2,8 +2,8 @@
 
 | Name  | CWL ID | SID
 |-------|--------|----
-| name0 | cwl0   | sid0
-| name1 | cwl1   | sid1 | Or delete this line if you don't have a partner
+| Matias Gauvin | matgauv   | 27796267
+| Dieter Frehlich | frehlid   | 14848410 | Or delete this line if you don't have a partner
 
 > [!NOTE]
 >
