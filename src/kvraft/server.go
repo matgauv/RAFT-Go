@@ -23,6 +23,7 @@ type ApplyFromRaft struct {
 	value    string
 	commited bool
 	ch       chan bool
+	term     int
 }
 
 type KVServer struct {
@@ -69,8 +70,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	if !ok {
 		kv.seqNoChanMap[args.ClerkId] = make(map[int]ApplyFromRaft)
 	}
+
+	term, _ := kv.rf.GetState()
 	ch := make(chan bool)
-	kv.seqNoChanMap[args.ClerkId][args.SeqNo] = ApplyFromRaft{value: "", commited: false, ch: ch}
+	kv.seqNoChanMap[args.ClerkId][args.SeqNo] = ApplyFromRaft{value: "", commited: false, ch: ch, term: term}
 	kv.mu.Unlock()
 
 	ok = <-ch
@@ -116,7 +119,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.seqNoChanMap[args.ClerkId] = make(map[int]ApplyFromRaft)
 	}
 	ch := make(chan bool)
-	kv.seqNoChanMap[args.ClerkId][args.SeqNo] = ApplyFromRaft{value: "", commited: false, ch: ch}
+	term, _ := kv.rf.GetState()
+	kv.seqNoChanMap[args.ClerkId][args.SeqNo] = ApplyFromRaft{value: "", commited: false, ch: ch, term: term}
 	kv.mu.Unlock()
 
 	ok = <-ch
@@ -132,23 +136,28 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) cancelPendingRPCs() {
 	for {
 		currentTerm, isLeader := kv.rf.GetState()
-		if !isLeader {
-			kv.mu.Lock()
-			kv.currentTerm = currentTerm
-
-			for _, clientMap := range kv.seqNoChanMap {
-				for _, aop := range clientMap {
-					if !aop.commited && aop.ch != nil {
-						select {
-						case aop.ch <- false:
-						default:
+		kv.mu.Lock()
+		if currentTerm > kv.currentTerm || !isLeader {
+			for clerkId, clientMap := range kv.seqNoChanMap {
+				for seqNo, msgInProgress := range clientMap {
+					if msgInProgress.term < currentTerm || !isLeader {
+						if !msgInProgress.commited && msgInProgress.ch != nil {
+							select {
+							case msgInProgress.ch <- false:
+							default:
+							}
 						}
+						delete(clientMap, seqNo)
 					}
 				}
+				if len(clientMap) == 0 {
+					delete(kv.seqNoChanMap, clerkId)
+				}
 			}
-			kv.mu.Unlock()
+			kv.currentTerm = currentTerm
 		}
-		time.Sleep(50 * time.Millisecond)
+		kv.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -177,8 +186,32 @@ func (kv *KVServer) Applier() {
 		case msg := <-kv.applyCh:
 			kv.mu.Lock()
 			op := msg.Command.(Op)
+
+			//currentTerm, _ := kv.rf.GetState()
+
+			//if msg.CommandTerm < currentTerm {
+			//	if op.Op == "Get" {
+			//		args := op.Value.(GetArgs)
+			//		applyFromRaft, ok := kv.seqNoChanMap[args.ClerkId][args.SeqNo]
+			//		if ok {
+			//			applyFromRaft.ch <- false
+			//			delete(kv.seqNoChanMap[args.ClerkId], args.SeqNo)
+			//		}
+			//	} else if op.Op == "PutAppend" {
+			//		args := op.Value.(PutAppendArgs)
+			//		applyFromRaft, ok := kv.seqNoChanMap[args.ClerkId][args.SeqNo]
+			//		if ok {
+			//			applyFromRaft.ch <- false
+			//			delete(kv.seqNoChanMap[args.ClerkId], args.SeqNo)
+			//		}
+			//	}
+			//	kv.mu.Unlock()
+			//
+			//	continue
+			//}
 			if op.Op == "Get" {
 				args := op.Value.(GetArgs)
+
 				value, ok2 := kv.store[args.Key]
 				if !ok2 {
 					value = ""

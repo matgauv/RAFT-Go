@@ -7,6 +7,7 @@ import (
 	"lab5/logger"
 	"math/big"
 	"sync"
+	"time"
 )
 
 type Clerk struct {
@@ -18,7 +19,7 @@ type Clerk struct {
 	sendSequenceNo    int // highest sequence number we have sent
 	deliverSequenceNo int // highest sequence number we have recieved
 
-	msgsToDeliver   []MessageToDeliver
+	msgsToDeliver   map[int]MessageToDeliver
 	msgLock         sync.Mutex
 	lastLeaderIndex int
 }
@@ -36,6 +37,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.sendSequenceNo = -1
 	ck.deliverSequenceNo = -1
 	ck.clerkId = int(nrand())
+	ck.msgsToDeliver = make(map[int]MessageToDeliver)
 	// You'll have to add code here.
 	ck.logger = logger.NewLogger(ck.clerkId, true, "Clerk", constants.ClerkLoggingMap)
 	ck.lastLeaderIndex = -1
@@ -46,19 +48,16 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 }
 
 func (ck *Clerk) Applier() {
-	// TODO: when to break out of this? add killed?
 	for {
 		ck.msgLock.Lock()
-		for i, msg := range ck.msgsToDeliver {
-			if msg.SeqNo == ck.deliverSequenceNo+1 {
-				ck.deliverSequenceNo++
-				msg.OutChan <- msg.Value
-				ck.msgsToDeliver = append(ck.msgsToDeliver[:i], ck.msgsToDeliver[i+1:]...)
-			}
+		nextSeq := ck.deliverSequenceNo + 1
+		if msg, ok := ck.msgsToDeliver[nextSeq]; ok {
+			delete(ck.msgsToDeliver, nextSeq)
+			ck.deliverSequenceNo = nextSeq
+			msg.OutChan <- msg.Value
 		}
-
 		ck.msgLock.Unlock()
-		//time.Sleep(10 * time.Millisecond)
+		time.Sleep(1 * time.Millisecond)
 	}
 }
 
@@ -107,7 +106,7 @@ func (ck *Clerk) Get(key string) string {
 	msg := MessageToDeliver{SeqNo: reply.SeqNo, Value: reply.Value, OutChan: OutChan}
 
 	ck.msgLock.Lock()
-	ck.msgsToDeliver = append(ck.msgsToDeliver, msg)
+	ck.msgsToDeliver[msg.SeqNo] = msg
 	ck.msgLock.Unlock()
 
 	return <-OutChan
@@ -154,7 +153,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	msg := MessageToDeliver{SeqNo: reply.SeqNo, Value: "", OutChan: OutChan}
 
 	ck.msgLock.Lock()
-	ck.msgsToDeliver = append(ck.msgsToDeliver, msg)
+	ck.msgsToDeliver[msg.SeqNo] = msg
 	ck.msgLock.Unlock()
 
 	<-OutChan

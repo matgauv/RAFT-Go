@@ -50,6 +50,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 }
 
 type LogEntry struct {
@@ -424,6 +425,7 @@ func (rf *Raft) checkAndApply(applyCh chan ApplyMsg) {
 					CommandValid: true,
 					Command:      entry.Command,
 					CommandIndex: first + i + 1,
+					CommandTerm:  entry.Term,
 				}
 				rf.logger.Log(0, "sending cmd %v", entry.Command)
 				applyCh <- applyMsg
