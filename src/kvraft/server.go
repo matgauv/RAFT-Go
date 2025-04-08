@@ -37,6 +37,7 @@ type KVServer struct {
 	// Your definitions here.
 	seqNoChanMap map[int]map[int]ApplyFromRaft
 	store        map[string]string
+	currentTerm  int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -72,7 +73,14 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.seqNoChanMap[args.ClerkId][args.SeqNo] = ApplyFromRaft{value: "", commited: false, ch: ch}
 	kv.mu.Unlock()
 
-	<-ch
+	ok = <-ch
+
+	// cancel rpc because we lost leadership
+	if !ok {
+		reply.Err = ErrWrongLeader
+		reply.SeqNo = args.SeqNo
+		return
+	}
 
 	kv.mu.Lock()
 	reply.Value = kv.seqNoChanMap[args.ClerkId][args.SeqNo].value
@@ -111,9 +119,37 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.seqNoChanMap[args.ClerkId][args.SeqNo] = ApplyFromRaft{value: "", commited: false, ch: ch}
 	kv.mu.Unlock()
 
-	<-ch
+	ok = <-ch
+	if !ok {
+		reply.Err = ErrWrongLeader
+		reply.SeqNo = args.SeqNo
+		return
+	}
 
 	reply.SeqNo = args.SeqNo
+}
+
+func (kv *KVServer) cancelPendingRPCs() {
+	for {
+		currentTerm, isLeader := kv.rf.GetState()
+		if !isLeader {
+			kv.mu.Lock()
+			kv.currentTerm = currentTerm
+
+			for _, clientMap := range kv.seqNoChanMap {
+				for _, aop := range clientMap {
+					if !aop.commited && aop.ch != nil {
+						select {
+						case aop.ch <- false:
+						default:
+						}
+					}
+				}
+			}
+			kv.mu.Unlock()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -192,7 +228,7 @@ func (kv *KVServer) Applier() {
 			}
 			kv.mu.Unlock()
 		}
-		time.Sleep(10 * time.Millisecond)
+		//time.Sleep(1 * time.Millisecond)
 	}
 }
 
@@ -224,6 +260,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.seqNoChanMap = make(map[int]map[int]ApplyFromRaft)
 	kv.store = make(map[string]string)
+	kv.currentTerm = -1
 
 	gob.Register(Op{})
 	gob.Register(PutAppendArgs{})
@@ -231,5 +268,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	go kv.Applier()
+	go kv.cancelPendingRPCs()
 	return kv
 }

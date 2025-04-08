@@ -7,7 +7,6 @@ import (
 	"lab5/logger"
 	"math/big"
 	"sync"
-	"time"
 )
 
 type Clerk struct {
@@ -59,7 +58,7 @@ func (ck *Clerk) Applier() {
 		}
 
 		ck.msgLock.Unlock()
-		time.Sleep(10 * time.Millisecond)
+		//time.Sleep(10 * time.Millisecond)
 	}
 }
 
