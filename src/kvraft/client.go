@@ -19,8 +19,9 @@ type Clerk struct {
 	sendSequenceNo    int // highest sequence number we have sent
 	deliverSequenceNo int // highest sequence number we have recieved
 
-	msgsToDeliver []MessageToDeliver
-	msgLock       sync.Mutex
+	msgsToDeliver   []MessageToDeliver
+	msgLock         sync.Mutex
+	lastLeaderIndex int
 }
 
 func nrand() int64 {
@@ -38,6 +39,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.clerkId = int(nrand())
 	// You'll have to add code here.
 	ck.logger = logger.NewLogger(ck.clerkId, true, "Clerk", constants.ClerkLoggingMap)
+	ck.lastLeaderIndex = -1
 
 	// thread that loops through messages, checks if highest sequence number == message seq number - 1, deliver to client
 	go ck.Applier()
@@ -72,7 +74,7 @@ func (ck *Clerk) Applier() {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{Key: key}
+	args := GetArgs{Key: key, ClerkId: ck.clerkId}
 
 	ck.msgLock.Lock()
 	ck.sendSequenceNo++
@@ -83,13 +85,21 @@ func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
 	for {
-		serverId := nrand() % int64(len(ck.servers))
+		var serverId int
+		if ck.lastLeaderIndex != -1 {
+			serverId = ck.lastLeaderIndex
+		} else {
+			serverId = int(nrand() % int64(len(ck.servers)))
+		}
+
 		ok := ck.servers[serverId].Call("KVServer.Get", &args, &reply)
 
 		if ok && reply.Err != ErrWrongLeader {
+			ck.lastLeaderIndex = serverId
 			break
 		}
 
+		ck.lastLeaderIndex = -1
 		reply = GetReply{} // clear if err was bad
 	}
 
@@ -114,7 +124,7 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	args := PutAppendArgs{Key: key, Value: value, Op: op}
+	args := PutAppendArgs{Key: key, ClerkId: ck.clerkId, Value: value, Op: op}
 	ck.msgLock.Lock()
 	ck.sendSequenceNo++
 	args.SeqNo = ck.sendSequenceNo
@@ -123,11 +133,20 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	var reply PutAppendReply
 
 	for {
-		serverId := nrand() % int64(len(ck.servers))
+		var serverId int
+		if ck.lastLeaderIndex != -1 {
+			serverId = ck.lastLeaderIndex
+		} else {
+			serverId = int(nrand() % int64(len(ck.servers)))
+		}
+
 		ok := ck.servers[serverId].Call("KVServer.PutAppend", &args, &reply)
 		if ok && reply.Err != ErrWrongLeader {
+			ck.lastLeaderIndex = serverId
 			break
 		}
+
+		ck.lastLeaderIndex = -1
 		reply = PutAppendReply{}
 	}
 

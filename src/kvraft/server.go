@@ -19,6 +19,12 @@ type Op struct {
 	Value interface{}
 }
 
+type ApplyFromRaft struct {
+	value    string
+	commited bool
+	ch       chan bool
+}
+
 type KVServer struct {
 	mu           sync.Mutex
 	me           int
@@ -29,11 +35,25 @@ type KVServer struct {
 
 	logger *logger.Logger
 	// Your definitions here.
-	seqNoChanMap map[int]chan bool
+	seqNoChanMap map[int]map[int]ApplyFromRaft
 	store        map[string]string
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+	kv.mu.Lock()
+	val, ok := kv.seqNoChanMap[args.ClerkId][args.SeqNo]
+	if ok && val.commited {
+		reply.SeqNo = args.SeqNo
+		reply.Value = val.value
+		kv.mu.Unlock()
+		return
+	}
+
+	if args.SeqNo != 0 {
+		delete(kv.seqNoChanMap[args.ClerkId], args.SeqNo-1)
+	}
+	kv.mu.Unlock()
+
 	op := Op{Op: "Get", Value: *args}
 	_, _, leader := kv.rf.Start(op)
 	if !leader {
@@ -44,26 +64,37 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	kv.mu.Lock()
-	kv.seqNoChanMap[args.SeqNo] = make(chan bool)
+	_, ok = kv.seqNoChanMap[args.ClerkId]
+	if !ok {
+		kv.seqNoChanMap[args.ClerkId] = make(map[int]ApplyFromRaft)
+	}
+	ch := make(chan bool)
+	kv.seqNoChanMap[args.ClerkId][args.SeqNo] = ApplyFromRaft{value: "", commited: false, ch: ch}
 	kv.mu.Unlock()
 
-	<-kv.seqNoChanMap[args.SeqNo]
+	<-ch
 
 	kv.mu.Lock()
-	delete(kv.seqNoChanMap, args.SeqNo)
-	val, ok := kv.store[args.Key]
-	if ok {
-		reply.Value = val
-	} else {
-		reply.Value = ""
-		reply.Err = ErrNoKey
-	}
+	reply.Value = kv.seqNoChanMap[args.ClerkId][args.SeqNo].value
 	kv.mu.Unlock()
 
 	reply.SeqNo = args.SeqNo
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	kv.mu.Lock()
+	val, ok := kv.seqNoChanMap[args.ClerkId][args.SeqNo]
+	if ok && val.commited {
+		reply.SeqNo = args.SeqNo
+		kv.mu.Unlock()
+		return
+	}
+
+	if args.SeqNo != 0 {
+		delete(kv.seqNoChanMap[args.ClerkId], args.SeqNo-1)
+	}
+	kv.mu.Unlock()
+
 	op := Op{Op: "PutAppend", Value: *args}
 	_, _, leader := kv.rf.Start(op)
 	if !leader {
@@ -72,14 +103,15 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 	kv.mu.Lock()
-	kv.seqNoChanMap[args.SeqNo] = make(chan bool)
+	_, ok = kv.seqNoChanMap[args.ClerkId]
+	if !ok {
+		kv.seqNoChanMap[args.ClerkId] = make(map[int]ApplyFromRaft)
+	}
+	ch := make(chan bool)
+	kv.seqNoChanMap[args.ClerkId][args.SeqNo] = ApplyFromRaft{value: "", commited: false, ch: ch}
 	kv.mu.Unlock()
 
-	<-kv.seqNoChanMap[args.SeqNo]
-
-	kv.mu.Lock()
-	delete(kv.seqNoChanMap, args.SeqNo)
-	kv.mu.Unlock()
+	<-ch
 
 	reply.SeqNo = args.SeqNo
 }
@@ -111,9 +143,23 @@ func (kv *KVServer) Applier() {
 			op := msg.Command.(Op)
 			if op.Op == "Get" {
 				args := op.Value.(GetArgs)
-				ch, ok := kv.seqNoChanMap[args.SeqNo]
-				if ok {
-					ch <- true
+				value, ok2 := kv.store[args.Key]
+				if !ok2 {
+					value = ""
+				}
+				applyFromRaft, ok1 := kv.seqNoChanMap[args.ClerkId][args.SeqNo]
+				if ok1 {
+					applyFromRaft.commited = true
+					applyFromRaft.value = value
+					kv.seqNoChanMap[args.ClerkId][args.SeqNo] = applyFromRaft
+
+					applyFromRaft.ch <- true
+				} else {
+					_, ok := kv.seqNoChanMap[args.ClerkId]
+					if !ok {
+						kv.seqNoChanMap[args.ClerkId] = make(map[int]ApplyFromRaft)
+					}
+					kv.seqNoChanMap[args.ClerkId][args.SeqNo] = ApplyFromRaft{value: value, commited: true, ch: nil}
 				}
 			} else if op.Op == "PutAppend" {
 				args := op.Value.(PutAppendArgs)
@@ -129,9 +175,18 @@ func (kv *KVServer) Applier() {
 					}
 				}
 
-				ch, ok := kv.seqNoChanMap[args.SeqNo]
+				applyFromRaft, ok := kv.seqNoChanMap[args.ClerkId][args.SeqNo]
 				if ok {
-					ch <- true
+					applyFromRaft.commited = true
+					kv.seqNoChanMap[args.ClerkId][args.SeqNo] = applyFromRaft
+
+					applyFromRaft.ch <- true
+				} else {
+					_, ok = kv.seqNoChanMap[args.ClerkId]
+					if !ok {
+						kv.seqNoChanMap[args.ClerkId] = make(map[int]ApplyFromRaft)
+					}
+					kv.seqNoChanMap[args.ClerkId][args.SeqNo] = ApplyFromRaft{value: "", commited: true, ch: nil}
 				}
 
 			}
@@ -167,7 +222,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.seqNoChanMap = make(map[int]chan bool)
+	kv.seqNoChanMap = make(map[int]map[int]ApplyFromRaft)
 	kv.store = make(map[string]string)
 
 	gob.Register(Op{})
