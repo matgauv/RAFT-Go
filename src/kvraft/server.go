@@ -1,7 +1,6 @@
 package kvraft
 
 import (
-	"encoding/gob"
 	"lab5/labgob"
 	"lab5/labrpc"
 	"lab5/logger"
@@ -16,14 +15,24 @@ type Op struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 	Op    string
-	Value interface{}
+	Key   string
+	Value string
+
+	SeqNo   int
+	ClerkId int
 }
 
+// for duplicate detection
 type ApplyFromRaft struct {
-	value    string
-	commited bool
-	ch       chan bool
-	term     int
+	SeqNo int
+	Value string
+}
+
+// holds all the msgs from raft, pass on chanel to rpc waiting
+type MsgToApply struct {
+	Term  int
+	Value string
+	Error Err
 }
 
 type KVServer struct {
@@ -36,28 +45,33 @@ type KVServer struct {
 
 	logger *logger.Logger
 	// Your definitions here.
-	seqNoChanMap map[int]map[int]ApplyFromRaft
-	store        map[string]string
-	currentTerm  int
+
+	// for each client what was the last request we processed (and result for duplicates)
+	appliedMap map[int]ApplyFromRaft
+
+	// rpc handlers listen on these channels
+	chMap map[int]chan MsgToApply
+
+	store       map[string]string
+	currentTerm int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
-	val, ok := kv.seqNoChanMap[args.ClerkId][args.SeqNo]
-	if ok && val.commited {
+	last, ok := kv.appliedMap[args.ClerkId]
+	// assume client sends seqno in order (1 rpc in flight at a time)
+	// thus if the seq no is <= the last seq number we already applied, it's a duplicate
+	if ok && args.SeqNo <= last.SeqNo {
 		reply.SeqNo = args.SeqNo
-		reply.Value = val.value
+		reply.Value = last.Value
 		kv.mu.Unlock()
 		return
 	}
 
-	if args.SeqNo != 0 {
-		delete(kv.seqNoChanMap[args.ClerkId], args.SeqNo-1)
-	}
 	kv.mu.Unlock()
 
-	op := Op{Op: "Get", Value: *args}
-	_, _, leader := kv.rf.Start(op)
+	op := Op{ClerkId: args.ClerkId, SeqNo: args.SeqNo, Op: "Get", Key: args.Key}
+	index, term, leader := kv.rf.Start(op)
 	if !leader {
 		reply.Value = ""
 		reply.Err = ErrWrongLeader
@@ -66,98 +80,71 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	kv.mu.Lock()
-	_, ok = kv.seqNoChanMap[args.ClerkId]
-	if !ok {
-		kv.seqNoChanMap[args.ClerkId] = make(map[int]ApplyFromRaft)
+	if kv.chMap[index] == nil {
+		kv.chMap[index] = make(chan MsgToApply, 1)
 	}
 
-	term, _ := kv.rf.GetState()
-	ch := make(chan bool)
-	kv.seqNoChanMap[args.ClerkId][args.SeqNo] = ApplyFromRaft{value: "", commited: false, ch: ch, term: term}
+	// we wait on this specific index to be written to, then check if the term is right
+	// if both are correct, we know it was our command  written by our leader
+	ch := kv.chMap[index]
 	kv.mu.Unlock()
 
-	ok = <-ch
-
-	// cancel rpc because we lost leadership
-	if !ok {
+	select {
+	case msg := <-ch:
+		// if the term is not the term we originally wrote in, we have lost leadership
+		if msg.Term != term {
+			reply.Err = ErrWrongLeader
+		} else {
+			reply.Err = msg.Error
+			reply.Value = msg.Value
+		}
+	// retry if taking too long...
+	case <-time.After(500 * time.Millisecond):
 		reply.Err = ErrWrongLeader
-		reply.SeqNo = args.SeqNo
-		return
 	}
 
-	kv.mu.Lock()
-	reply.Value = kv.seqNoChanMap[args.ClerkId][args.SeqNo].value
-	kv.mu.Unlock()
-
-	reply.SeqNo = args.SeqNo
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
-	val, ok := kv.seqNoChanMap[args.ClerkId][args.SeqNo]
-	if ok && val.commited {
+	// assume client sends seqno in order (1 rpc in flight at a time)
+	// thus if the seq no is <= the last seq number we already applied, it's a duplicate
+	last, ok := kv.appliedMap[args.ClerkId]
+	if ok && args.SeqNo <= last.SeqNo {
+		reply.Err = OK
 		reply.SeqNo = args.SeqNo
 		kv.mu.Unlock()
 		return
 	}
-
-	if args.SeqNo != 0 {
-		delete(kv.seqNoChanMap[args.ClerkId], args.SeqNo-1)
-	}
 	kv.mu.Unlock()
 
-	op := Op{Op: "PutAppend", Value: *args}
-	_, _, leader := kv.rf.Start(op)
+	op := Op{ClerkId: args.ClerkId, SeqNo: args.SeqNo, Op: args.Op, Key: args.Key, Value: args.Value}
+	index, term, leader := kv.rf.Start(op)
 	if !leader {
 		reply.Err = ErrWrongLeader
 		reply.SeqNo = args.SeqNo
 		return
 	}
 	kv.mu.Lock()
-	_, ok = kv.seqNoChanMap[args.ClerkId]
-	if !ok {
-		kv.seqNoChanMap[args.ClerkId] = make(map[int]ApplyFromRaft)
+	if kv.chMap[index] == nil {
+		kv.chMap[index] = make(chan MsgToApply, 1)
 	}
-	ch := make(chan bool)
-	term, _ := kv.rf.GetState()
-	kv.seqNoChanMap[args.ClerkId][args.SeqNo] = ApplyFromRaft{value: "", commited: false, ch: ch, term: term}
+
+	// we wait on this specific index to be written to, then check if the term is right
+	// if both are correct, we know it was our command  written by our leader
+	ch := kv.chMap[index]
 	kv.mu.Unlock()
 
-	ok = <-ch
-	if !ok {
-		reply.Err = ErrWrongLeader
-		reply.SeqNo = args.SeqNo
-		return
-	}
-
-	reply.SeqNo = args.SeqNo
-}
-
-func (kv *KVServer) cancelPendingRPCs() {
-	for {
-		currentTerm, isLeader := kv.rf.GetState()
-		kv.mu.Lock()
-		if currentTerm > kv.currentTerm || !isLeader {
-			for clerkId, clientMap := range kv.seqNoChanMap {
-				for seqNo, msgInProgress := range clientMap {
-					if msgInProgress.term < currentTerm || !isLeader {
-						if !msgInProgress.commited && msgInProgress.ch != nil {
-							select {
-							case msgInProgress.ch <- false:
-							default:
-							}
-						}
-						delete(clientMap, seqNo)
-					}
-				}
-				if len(clientMap) == 0 {
-					delete(kv.seqNoChanMap, clerkId)
-				}
-			}
-			kv.currentTerm = currentTerm
+	select {
+	case msg := <-ch:
+		// if the term is not the term we originally wrote in, we have lost leadership
+		if msg.Term != term {
+			reply.Err = ErrWrongLeader
+		} else {
+			reply.Err = msg.Error
 		}
-		kv.mu.Unlock()
-		time.Sleep(10 * time.Millisecond)
+	case <-time.After(500 * time.Millisecond):
+		reply.Err = ErrWrongLeader
 	}
 }
 
@@ -181,87 +168,45 @@ func (kv *KVServer) killed() bool {
 }
 
 func (kv *KVServer) Applier() {
-	for {
-		select {
-		case msg := <-kv.applyCh:
-			kv.mu.Lock()
+	for msg := range kv.applyCh {
+		if msg.CommandValid {
 			op := msg.Command.(Op)
 
-			//currentTerm, _ := kv.rf.GetState()
+			commandIndex := msg.CommandIndex
+			commandTerm := msg.CommandTerm
 
-			//if msg.CommandTerm < currentTerm {
-			//	if op.Op == "Get" {
-			//		args := op.Value.(GetArgs)
-			//		applyFromRaft, ok := kv.seqNoChanMap[args.ClerkId][args.SeqNo]
-			//		if ok {
-			//			applyFromRaft.ch <- false
-			//			delete(kv.seqNoChanMap[args.ClerkId], args.SeqNo)
-			//		}
-			//	} else if op.Op == "PutAppend" {
-			//		args := op.Value.(PutAppendArgs)
-			//		applyFromRaft, ok := kv.seqNoChanMap[args.ClerkId][args.SeqNo]
-			//		if ok {
-			//			applyFromRaft.ch <- false
-			//			delete(kv.seqNoChanMap[args.ClerkId], args.SeqNo)
-			//		}
-			//	}
-			//	kv.mu.Unlock()
-			//
-			//	continue
-			//}
-			if op.Op == "Get" {
-				args := op.Value.(GetArgs)
-
-				value, ok2 := kv.store[args.Key]
-				if !ok2 {
-					value = ""
-				}
-				applyFromRaft, ok1 := kv.seqNoChanMap[args.ClerkId][args.SeqNo]
-				if ok1 {
-					applyFromRaft.commited = true
-					applyFromRaft.value = value
-					kv.seqNoChanMap[args.ClerkId][args.SeqNo] = applyFromRaft
-
-					applyFromRaft.ch <- true
-				} else {
-					_, ok := kv.seqNoChanMap[args.ClerkId]
-					if !ok {
-						kv.seqNoChanMap[args.ClerkId] = make(map[int]ApplyFromRaft)
-					}
-					kv.seqNoChanMap[args.ClerkId][args.SeqNo] = ApplyFromRaft{value: value, commited: true, ch: nil}
-				}
-			} else if op.Op == "PutAppend" {
-				args := op.Value.(PutAppendArgs)
-
-				if args.Op == "Put" {
-					kv.store[args.Key] = args.Value
-				} else if args.Op == "Append" {
-					val, ok := kv.store[args.Key]
-					if ok {
-						kv.store[args.Key] = val + args.Value
-					} else {
-						kv.store[args.Key] = args.Value
-					}
+			kv.mu.Lock()
+			last, ok := kv.appliedMap[op.ClerkId]
+			// check if duplicate / old request first
+			if !ok || op.SeqNo > last.SeqNo {
+				result := ""
+				if op.Op == "Put" {
+					kv.store[op.Key] = op.Value
+				} else if op.Op == "Append" {
+					curr := kv.store[op.Key]
+					kv.store[op.Key] = curr + op.Value
+				} else if op.Op == "Get" {
+					result = kv.store[op.Key]
 				}
 
-				applyFromRaft, ok := kv.seqNoChanMap[args.ClerkId][args.SeqNo]
-				if ok {
-					applyFromRaft.commited = true
-					kv.seqNoChanMap[args.ClerkId][args.SeqNo] = applyFromRaft
-
-					applyFromRaft.ch <- true
-				} else {
-					_, ok = kv.seqNoChanMap[args.ClerkId]
-					if !ok {
-						kv.seqNoChanMap[args.ClerkId] = make(map[int]ApplyFromRaft)
-					}
-					kv.seqNoChanMap[args.ClerkId][args.SeqNo] = ApplyFromRaft{value: "", commited: true, ch: nil}
+				// keep track of everything applied for duplicate detection
+				kv.appliedMap[op.ClerkId] = ApplyFromRaft{SeqNo: op.SeqNo, Value: result}
+			}
+			ch, chExists := kv.chMap[commandIndex]
+			if chExists {
+				finalVal := ""
+				if op.Op == "Get" {
+					finalVal = kv.store[op.Key]
 				}
 
+				// notify waiting RPC call that something was written at it's pending log index
+				notif := MsgToApply{Term: commandTerm, Value: finalVal, Error: OK}
+				ch <- notif
+				close(ch)
+				delete(kv.chMap, commandIndex)
 			}
 			kv.mu.Unlock()
 		}
-		//time.Sleep(1 * time.Millisecond)
 	}
 }
 
@@ -291,16 +236,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.seqNoChanMap = make(map[int]map[int]ApplyFromRaft)
+	kv.chMap = make(map[int]chan MsgToApply)
+	kv.appliedMap = make(map[int]ApplyFromRaft)
 	kv.store = make(map[string]string)
 	kv.currentTerm = -1
 
-	gob.Register(Op{})
-	gob.Register(PutAppendArgs{})
-	gob.Register(GetArgs{})
-
 	// You may need initialization code here.
 	go kv.Applier()
-	go kv.cancelPendingRPCs()
 	return kv
 }

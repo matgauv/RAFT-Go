@@ -7,7 +7,6 @@ import (
 	"lab5/logger"
 	"math/big"
 	"sync"
-	"time"
 )
 
 type Clerk struct {
@@ -16,12 +15,10 @@ type Clerk struct {
 	clerkId int
 	// You will have to modify this struct.
 
-	sendSequenceNo    int // highest sequence number we have sent
-	deliverSequenceNo int // highest sequence number we have recieved
+	sendSequenceNo int // highest sequence number we have sent
 
-	msgsToDeliver   map[int]MessageToDeliver
-	msgLock         sync.Mutex
 	lastLeaderIndex int
+	mu              sync.Mutex
 }
 
 func nrand() int64 {
@@ -35,30 +32,13 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	ck.sendSequenceNo = -1
-	ck.deliverSequenceNo = -1
 	ck.clerkId = int(nrand())
-	ck.msgsToDeliver = make(map[int]MessageToDeliver)
 	// You'll have to add code here.
 	ck.logger = logger.NewLogger(ck.clerkId, true, "Clerk", constants.ClerkLoggingMap)
 	ck.lastLeaderIndex = -1
 
 	// thread that loops through messages, checks if highest sequence number == message seq number - 1, deliver to client
-	go ck.Applier()
 	return ck
-}
-
-func (ck *Clerk) Applier() {
-	for {
-		ck.msgLock.Lock()
-		nextSeq := ck.deliverSequenceNo + 1
-		if msg, ok := ck.msgsToDeliver[nextSeq]; ok {
-			delete(ck.msgsToDeliver, nextSeq)
-			ck.deliverSequenceNo = nextSeq
-			msg.OutChan <- msg.Value
-		}
-		ck.msgLock.Unlock()
-		time.Sleep(1 * time.Millisecond)
-	}
 }
 
 // fetch the current value for a key.
@@ -72,17 +52,18 @@ func (ck *Clerk) Applier() {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{Key: key, ClerkId: ck.clerkId}
 
-	ck.msgLock.Lock()
+	ck.mu.Lock()
 	ck.sendSequenceNo++
-	args.SeqNo = ck.sendSequenceNo
-	ck.msgLock.Unlock()
+	seq := ck.sendSequenceNo
+	ck.mu.Unlock()
 
-	var reply GetReply
+	args := GetArgs{Key: key, ClerkId: ck.clerkId, SeqNo: seq}
 
 	// You will have to modify this function.
 	for {
+		var reply GetReply
+
 		var serverId int
 		if ck.lastLeaderIndex != -1 {
 			serverId = ck.lastLeaderIndex
@@ -94,22 +75,11 @@ func (ck *Clerk) Get(key string) string {
 
 		if ok && reply.Err != ErrWrongLeader {
 			ck.lastLeaderIndex = serverId
-			break
+			return reply.Value
 		}
 
 		ck.lastLeaderIndex = -1
-		reply = GetReply{} // clear if err was bad
 	}
-
-	OutChan := make(chan string)
-
-	msg := MessageToDeliver{SeqNo: reply.SeqNo, Value: reply.Value, OutChan: OutChan}
-
-	ck.msgLock.Lock()
-	ck.msgsToDeliver[msg.SeqNo] = msg
-	ck.msgLock.Unlock()
-
-	return <-OutChan
 }
 
 // shared by Put and Append.
@@ -122,15 +92,15 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	args := PutAppendArgs{Key: key, ClerkId: ck.clerkId, Value: value, Op: op}
-	ck.msgLock.Lock()
+	ck.mu.Lock()
 	ck.sendSequenceNo++
-	args.SeqNo = ck.sendSequenceNo
-	ck.msgLock.Unlock()
+	seq := ck.sendSequenceNo
+	ck.mu.Unlock()
 
-	var reply PutAppendReply
+	args := PutAppendArgs{Key: key, ClerkId: ck.clerkId, Value: value, Op: op, SeqNo: seq}
 
 	for {
+		var reply PutAppendReply
 		var serverId int
 		if ck.lastLeaderIndex != -1 {
 			serverId = ck.lastLeaderIndex
@@ -141,23 +111,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		ok := ck.servers[serverId].Call("KVServer.PutAppend", &args, &reply)
 		if ok && reply.Err != ErrWrongLeader {
 			ck.lastLeaderIndex = serverId
-			break
+			return
 		}
 
 		ck.lastLeaderIndex = -1
-		reply = PutAppendReply{}
 	}
-
-	OutChan := make(chan string)
-
-	msg := MessageToDeliver{SeqNo: reply.SeqNo, Value: "", OutChan: OutChan}
-
-	ck.msgLock.Lock()
-	ck.msgsToDeliver[msg.SeqNo] = msg
-	ck.msgLock.Unlock()
-
-	<-OutChan
-	return
 }
 
 func (ck *Clerk) Put(key string, value string) {
