@@ -13,21 +13,31 @@ type PutAppendArgs struct {
 	Key   string
 	Value string
 	Op    string // "Put" or "Append"
+	SeqNo int
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 }
 
 type PutAppendReply struct {
-	Err Err
+	Err   Err
+	SeqNo int
 }
 
 type GetArgs struct {
-	Key string
+	Key   string
+	SeqNo int
 	// You'll have to add definitions here.
 }
 
 type GetReply struct {
 	Err   Err
 	Value string
+	SeqNo int
+}
+
+type MessageToDeliver struct {
+	SeqNo   int
+	Value   string
+	OutChan chan string
 }

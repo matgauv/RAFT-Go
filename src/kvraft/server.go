@@ -1,36 +1,87 @@
 package kvraft
 
 import (
+	"encoding/gob"
 	"lab5/labgob"
 	"lab5/labrpc"
+	"lab5/logger"
 	"lab5/raft"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Op    string
+	Value interface{}
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
+	mu           sync.Mutex
+	me           int
+	rf           *raft.Raft
+	applyCh      chan raft.ApplyMsg
+	dead         int32 // set by Kill()
+	maxraftstate int
 
-	logger *Logger
+	logger *logger.Logger
 	// Your definitions here.
+	seqNoChanMap map[int]chan bool
+	store        map[string]string
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	op := Op{Op: "Get", Value: *args}
+	_, _, leader := kv.rf.Start(op)
+	if !leader {
+		reply.Value = ""
+		reply.Err = ErrWrongLeader
+		reply.SeqNo = args.SeqNo
+		return
+	}
+
+	kv.mu.Lock()
+	kv.seqNoChanMap[args.SeqNo] = make(chan bool)
+	kv.mu.Unlock()
+
+	<-kv.seqNoChanMap[args.SeqNo]
+
+	kv.mu.Lock()
+	delete(kv.seqNoChanMap, args.SeqNo)
+	val, ok := kv.store[args.Key]
+	if ok {
+		reply.Value = val
+	} else {
+		reply.Value = ""
+		reply.Err = ErrNoKey
+	}
+	kv.mu.Unlock()
+
+	reply.SeqNo = args.SeqNo
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	op := Op{Op: "PutAppend", Value: *args}
+	_, _, leader := kv.rf.Start(op)
+	if !leader {
+		reply.Err = ErrWrongLeader
+		reply.SeqNo = args.SeqNo
+		return
+	}
+	kv.mu.Lock()
+	kv.seqNoChanMap[args.SeqNo] = make(chan bool)
+	kv.mu.Unlock()
+
+	<-kv.seqNoChanMap[args.SeqNo]
+
+	kv.mu.Lock()
+	delete(kv.seqNoChanMap, args.SeqNo)
+	kv.mu.Unlock()
+
+	reply.SeqNo = args.SeqNo
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -52,6 +103,44 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+func (kv *KVServer) Applier() {
+	for {
+		select {
+		case msg := <-kv.applyCh:
+			kv.mu.Lock()
+			op := msg.Command.(Op)
+			if op.Op == "Get" {
+				args := op.Value.(GetArgs)
+				ch, ok := kv.seqNoChanMap[args.SeqNo]
+				if ok {
+					ch <- true
+				}
+			} else if op.Op == "PutAppend" {
+				args := op.Value.(PutAppendArgs)
+
+				if args.Op == "Put" {
+					kv.store[args.Key] = args.Value
+				} else if args.Op == "Append" {
+					val, ok := kv.store[args.Key]
+					if ok {
+						kv.store[args.Key] = val + args.Value
+					} else {
+						kv.store[args.Key] = args.Value
+					}
+				}
+
+				ch, ok := kv.seqNoChanMap[args.SeqNo]
+				if ok {
+					ch <- true
+				}
+
+			}
+			kv.mu.Unlock()
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
@@ -65,7 +154,7 @@ func (kv *KVServer) killed() bool {
 // StartKVServer() must return quickly, so it should start goroutines
 // for any long-running work.
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
-	logger := Logger(me)
+	//logger := logger.NewLogger(me, )
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
@@ -78,8 +167,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.seqNoChanMap = make(map[int]chan bool)
+	kv.store = make(map[string]string)
+
+	gob.Register(Op{})
+	gob.Register(PutAppendArgs{})
+	gob.Register(GetArgs{})
 
 	// You may need initialization code here.
-
+	go kv.Applier()
 	return kv
 }
